@@ -157,5 +157,31 @@ void main() {
         );
       });
     });
+
+    group('RAR4 support tests', () {
+      const testRar4Path = 'The Question 026 (C2C)(TCR).cbr';
+
+      test('should open a valid RAR4 archive successfully', () async {
+        final rarFile = await RarArchiveReader.open(testRar4Path);
+        expect(rarFile, isNotNull);
+        expect(rarFile, isA<RarFile>());
+      });
+
+      test('should retrieve RAR4 entries with correct attributes', () async {
+        final rarFile = await RarArchiveReader.open(testRar4Path);
+        final entries = await rarFile.getArchiveEntries();
+
+        expect(entries, isNotEmpty);
+        
+        final dirEntry = entries.firstWhere((e) => e.name == 'The Question #026');
+        expect(dirEntry.isDirectory, isTrue);
+        expect(dirEntry.size, equals(0));
+
+        final fileEntry = entries.firstWhere((e) => e.name == 'The Question #026/TheQuestion#026-00.jpg');
+        expect(fileEntry.isDirectory, isFalse);
+        expect(fileEntry.size, equals(871055));
+        expect(fileEntry.packedSize, equals(854675));
+      });
+    });
   });
 }
