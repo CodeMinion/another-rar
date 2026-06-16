@@ -197,10 +197,11 @@ void main() {
         expect(decompressedData, isNotEmpty);
         expect(decompressedData.length, equals(871055));
 
-        // Verify JPEG magic bytes FF D8 FF
-        expect(decompressedData[0], equals(0xFF));
-        expect(decompressedData[1], equals(0xD8));
-        expect(decompressedData[2], equals(0xFF));
+        // Read the reference file and verify the decompressed bytes match exactly
+        final referenceFile = File('The Question #026/TheQuestion#026-00.jpg');
+        expect(referenceFile.existsSync(), isTrue);
+        final referenceBytes = await referenceFile.readAsBytes();
+        expect(decompressedData, equals(referenceBytes));
       });
     });
   });

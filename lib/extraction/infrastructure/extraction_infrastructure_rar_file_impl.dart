@@ -916,7 +916,6 @@ class _Rar4Decompressor {
         continue;
       }
       if (num == 256) {
-        bstream.readBits((8 - bstream.bitPtr) & 0x7);
         bool newTable = false;
         bool newFile = false;
         if (bstream.readBits(1) != 0) {
