@@ -1,0 +1,14 @@
+name: another_rar
+description: A pure Dart library for reading and extracting RAR archives in a streaming, random-access fashion.
+version: 0.1.0
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  meta: ^1.11.0
+  universal_io: ^2.3.1
+
+dev_dependencies:
+  test: ^1.24.0
+  lints: ^3.0.0
