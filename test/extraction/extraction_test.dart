@@ -172,15 +172,35 @@ void main() {
         final entries = await rarFile.getArchiveEntries();
 
         expect(entries, isNotEmpty);
-        
-        final dirEntry = entries.firstWhere((e) => e.name == 'The Question #026');
+
+        final dirEntry =
+            entries.firstWhere((e) => e.name == 'The Question #026');
         expect(dirEntry.isDirectory, isTrue);
         expect(dirEntry.size, equals(0));
 
-        final fileEntry = entries.firstWhere((e) => e.name == 'The Question #026/TheQuestion#026-00.jpg');
+        final fileEntry = entries.firstWhere(
+            (e) => e.name == 'The Question #026/TheQuestion#026-00.jpg');
         expect(fileEntry.isDirectory, isFalse);
         expect(fileEntry.size, equals(871055));
         expect(fileEntry.packedSize, equals(854675));
+      });
+
+      test('should extract compressed image entry and decompress successfully',
+          () async {
+        final rarFile = await RarArchiveReader.open(testRar4Path);
+        final entry = await rarFile.findEntry(
+            name: 'The Question #026/TheQuestion#026-00.jpg');
+
+        expect(entry.compressionMethod, equals(0x33));
+
+        final decompressedData = await rarFile.extractEntry(entry: entry);
+        expect(decompressedData, isNotEmpty);
+        expect(decompressedData.length, equals(871055));
+
+        // Verify JPEG magic bytes FF D8 FF
+        expect(decompressedData[0], equals(0xFF));
+        expect(decompressedData[1], equals(0xD8));
+        expect(decompressedData[2], equals(0xFF));
       });
     });
   });

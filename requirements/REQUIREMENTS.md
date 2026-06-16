@@ -11,7 +11,7 @@ Dart native Flutter package for reading RAR archives. This performs the reading 
 ## Tasks
 |Status| File | Purpose |
 |-------|------|---------|
-| DONE  | [Extraction Context](Context/Extraction/REQUIREMENTS.md) | Complete defition of the extraction context required for reading a RAR archive. |
+| REDO  | [Extraction Context](Context/Extraction/REQUIREMENTS.md) | Complete defition of the extraction context required for reading a RAR archive. |
 
 
 ## Reference Documentation

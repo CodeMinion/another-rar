@@ -254,7 +254,8 @@ class RarFileImpl implements RarFile {
       int addSize = 0;
       if (hasAdd) {
         if (offset + 11 > len) {
-          throw RarException('Truncated block header for addSize at offset $offset');
+          throw RarException(
+              'Truncated block header for addSize at offset $offset');
         }
         final addSizeBytes = await raf.read(4);
         addSize = (addSizeBytes[3] << 24) |
@@ -308,7 +309,8 @@ class RarFileImpl implements RarFile {
 
         if ((flags & 0x0100) != 0) {
           if (bodySize < 29) {
-            throw RarException('File header body too short for 64-bit sizes at offset $offset');
+            throw RarException(
+                'File header body too short for 64-bit sizes at offset $offset');
           }
           highPackSize = (bodyBytes[24] << 24) |
               (bodyBytes[23] << 16) |
@@ -322,7 +324,8 @@ class RarFileImpl implements RarFile {
         }
 
         if (nameOffset + nameSize > bodySize) {
-          throw RarException('File name extends beyond block body size at offset $offset');
+          throw RarException(
+              'File name extends beyond block body size at offset $offset');
         }
 
         final nameBytes = bodyBytes.sublist(nameOffset, nameOffset + nameSize);
@@ -330,7 +333,8 @@ class RarFileImpl implements RarFile {
         if ((flags & 0x0200) != 0) {
           final nullIdx = nameBytes.indexOf(0);
           if (nullIdx != -1) {
-            name = utf8.decode(nameBytes.sublist(0, nullIdx), allowMalformed: true);
+            name = utf8.decode(nameBytes.sublist(0, nullIdx),
+                allowMalformed: true);
           } else {
             name = utf8.decode(nameBytes, allowMalformed: true);
           }
@@ -397,10 +401,10 @@ class RarFileImpl implements RarFile {
       return const [];
     }
 
-    if (entry.compressionMethod != 0) {
+    if (entry.compressionMethod != 0 && entry.compressionMethod != 0x33) {
       final err =
           'Unsupported compression method: 0x${entry.compressionMethod.toRadixString(16)}. '
-          'Only stored (uncompressed) entries are supported.';
+          'Only stored (uncompressed) entries and RAR4 normal (0x33) compression are supported.';
       stderr.writeln(err);
       throw RarException(err);
     }
@@ -415,7 +419,14 @@ class RarFileImpl implements RarFile {
             'Truncated file data for "${entry.name}": Read ${data.length} bytes, expected ${entry.packedSize}.',
           );
         }
-        return data;
+
+        if (entry.compressionMethod == 0x33) {
+          final bstream = _RarBitStream(data);
+          final decompressor = _Rar4Decompressor();
+          return decompressor.decompress(bstream, entry.size);
+        } else {
+          return data;
+        }
       } finally {
         await raf.close();
       }
@@ -492,5 +503,474 @@ class _BytesReader {
     final result = _bytes.sublist(_offset, _offset + count);
     _offset += count;
     return result;
+  }
+}
+
+// ----------------- RAR4 Decompression Classes -----------------
+
+class _RarBitStream {
+  final List<int> bytes;
+  int bytePtr = 0;
+  int bitPtr = 0;
+  int bitsRead = 0;
+
+  _RarBitStream(this.bytes);
+
+  int getNumBitsLeft() {
+    final bitsLeftInByte = 8 - bitPtr;
+    return (bytes.length - bytePtr - 1) * 8 + bitsLeftInByte;
+  }
+
+  static const bitmasks = [0, 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF];
+
+  int peekBits(int n, [bool movePointers = false]) {
+    if (n <= 0) return 0;
+    int num = n;
+    int curBytePtr = bytePtr;
+    int curBitPtr = bitPtr;
+    int result = 0;
+
+    while (num > 0) {
+      if (curBytePtr >= bytes.length) {
+        break;
+      }
+      final numBitsLeftInThisByte = 8 - curBitPtr;
+      if (num >= numBitsLeftInThisByte) {
+        result <<= numBitsLeftInThisByte;
+        result |= (bitmasks[numBitsLeftInThisByte] & bytes[curBytePtr]);
+        curBytePtr++;
+        curBitPtr = 0;
+        num -= numBitsLeftInThisByte;
+      } else {
+        result <<= num;
+        final numBits = 8 - num - curBitPtr;
+        result |= ((bytes[curBytePtr] & (bitmasks[num] << numBits)) >> numBits);
+        curBitPtr += num;
+        break;
+      }
+    }
+
+    if (movePointers) {
+      bitPtr = curBitPtr;
+      bytePtr = curBytePtr;
+      bitsRead += n;
+    }
+    return result;
+  }
+
+  int readBits(int n) {
+    return peekBits(n, true);
+  }
+
+  int getBits() {
+    if (bytePtr >= bytes.length) return 0;
+    final b0 = bytes[bytePtr];
+    final b1 = (bytePtr + 1 < bytes.length) ? bytes[bytePtr + 1] : 0;
+    final b2 = (bytePtr + 2 < bytes.length) ? bytes[bytePtr + 2] : 0;
+    return (((((b0 & 0xff) << 16) + ((b1 & 0xff) << 8) + (b2 & 0xff))) >>>
+            (8 - bitPtr)) &
+        0xffff;
+  }
+}
+
+class _RarHuffmanDecoder {
+  final decodeLen = List<int>.filled(16, 0);
+  final decodePos = List<int>.filled(16, 0);
+  final List<int> decodeNum;
+
+  _RarHuffmanDecoder(int size) : decodeNum = List<int>.filled(size, 0);
+}
+
+class _RarByteBuffer {
+  final List<int> data;
+  int ptr = 0;
+  _RarByteBuffer(int size) : data = List<int>.filled(size, 0);
+
+  void insertByte(int byte) {
+    if (ptr < data.length) {
+      data[ptr++] = byte;
+    }
+  }
+}
+
+class _Rar4Decompressor {
+  static const rNC = 299;
+  static const rDC = 60;
+  static const rLDC = 17;
+  static const rRC = 28;
+  static const rBC = 20;
+  static const rHUFF_TABLE_SIZE = (rNC + rDC + rRC + rLDC);
+
+  final unpOldTable = List<int>.filled(rHUFF_TABLE_SIZE, 0);
+
+  final bd = _RarHuffmanDecoder(rBC);
+  final ld = _RarHuffmanDecoder(rNC);
+  final dd = _RarHuffmanDecoder(rDC);
+  final ldd = _RarHuffmanDecoder(rLDC);
+  final rd = _RarHuffmanDecoder(rRC);
+
+  static const rLDecode = [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    10,
+    12,
+    14,
+    16,
+    20,
+    24,
+    28,
+    32,
+    40,
+    48,
+    56,
+    64,
+    80,
+    96,
+    112,
+    128,
+    160,
+    192,
+    224
+  ];
+  static const rLBits = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    3,
+    3,
+    3,
+    3,
+    4,
+    4,
+    4,
+    4,
+    5,
+    5,
+    5,
+    5
+  ];
+  static const rDBitLengthCounts = [
+    4,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    14,
+    0,
+    12
+  ];
+  static const rSDDecode = [0, 4, 8, 16, 32, 64, 128, 192];
+  static const rSDBits = [2, 2, 3, 4, 5, 6, 6, 6];
+
+  final rOldDist = [0, 0, 0, 0];
+  int lastDist = 0;
+  int lastLength = 0;
+  int lowDistRepCount = 0;
+  int prevLowDist = 0;
+
+  void rarInsertOldDist(int distance) {
+    rOldDist.removeAt(3);
+    rOldDist.insert(0, distance);
+  }
+
+  void rarInsertLastMatch(int length, int distance) {
+    lastDist = distance;
+    lastLength = length;
+  }
+
+  late _RarByteBuffer rBuffer;
+
+  void rarCopyString(int len, int distance) {
+    int srcPtr = rBuffer.ptr - distance;
+    if (srcPtr < 0) {
+      throw RarException(
+          'Back-reference points before the start of the buffer');
+    }
+    for (int i = 0; i < len; i++) {
+      rBuffer.insertByte(rBuffer.data[srcPtr++]);
+    }
+  }
+
+  bool rarReadTables(_RarBitStream bstream) {
+    final bitLength = List<int>.filled(rBC, 0);
+    final table = List<int>.filled(rHUFF_TABLE_SIZE, 0);
+
+    bstream.readBits((8 - bstream.bitPtr) & 0x7);
+
+    if (bstream.readBits(1) != 0) {
+      throw RarException('PPM not supported');
+    }
+
+    if (bstream.readBits(1) == 0) {
+      unpOldTable.fillRange(0, unpOldTable.length, 0);
+    }
+
+    for (int i = 0; i < rBC; ++i) {
+      final length = bstream.readBits(4);
+      if (length == 15) {
+        int zeroCount = bstream.readBits(4);
+        if (zeroCount == 0) {
+          bitLength[i] = 15;
+        } else {
+          zeroCount += 2;
+          while (zeroCount-- > 0 && i < rBC) {
+            bitLength[i++] = 0;
+          }
+          --i;
+        }
+      } else {
+        bitLength[i] = length;
+      }
+    }
+
+    rarMakeDecodeTables(bitLength, 0, bd, rBC);
+
+    const tableSize = rHUFF_TABLE_SIZE;
+    for (int i = 0; i < tableSize;) {
+      final num = rarDecodeNumber(bstream, bd);
+      if (num < 16) {
+        table[i] = (num + unpOldTable[i]) & 0xf;
+        i++;
+      } else if (num < 18) {
+        int n = (num == 16)
+            ? (bstream.readBits(3) + 3)
+            : (bstream.readBits(7) + 11);
+        while (n-- > 0 && i < tableSize) {
+          table[i] = table[i - 1];
+          i++;
+        }
+      } else {
+        int n = (num == 18)
+            ? (bstream.readBits(3) + 3)
+            : (bstream.readBits(7) + 11);
+        while (n-- > 0 && i < tableSize) {
+          table[i++] = 0;
+        }
+      }
+    }
+
+    rarMakeDecodeTables(table, 0, ld, rNC);
+    rarMakeDecodeTables(table, rNC, dd, rDC);
+    rarMakeDecodeTables(table, rNC + rDC, ldd, rLDC);
+    rarMakeDecodeTables(table, rNC + rDC + ldd.decodeNum.length, rd,
+        rRC); // Wait, make decode tables RD uses rd, rRC, but the offset is rNC + rDC + rLDC!
+
+    for (int i = 0; i < unpOldTable.length; i++) {
+      unpOldTable[i] = table[i];
+    }
+    return true;
+  }
+
+  int rarDecodeNumber(_RarBitStream bstream, _RarHuffmanDecoder dec) {
+    final bitField = bstream.getBits() & 0xfffe;
+    int bits = 15;
+    for (int i = 1; i < 16; i++) {
+      if (bitField < dec.decodeLen[i]) {
+        bits = i;
+        break;
+      }
+    }
+    bstream.readBits(bits);
+    final pos = dec.decodePos[bits] +
+        ((bitField - dec.decodeLen[bits - 1]) >>> (16 - bits));
+    if (pos < 0 || pos >= dec.decodeNum.length) {
+      throw RarException('Decode error: pos $pos out of bounds');
+    }
+    return dec.decodeNum[pos];
+  }
+
+  void rarMakeDecodeTables(
+      List<int> bitLength, int offset, _RarHuffmanDecoder dec, int size) {
+    final lenCount = List<int>.filled(16, 0);
+    final tmpPos = List<int>.filled(16, 0);
+    int n = 0;
+    int m = 0;
+
+    dec.decodeNum.fillRange(0, dec.decodeNum.length, 0);
+    for (int i = 0; i < size; i++) {
+      lenCount[bitLength[i + offset] & 0xF]++;
+    }
+    lenCount[0] = 0;
+    tmpPos[0] = 0;
+    dec.decodePos[0] = 0;
+    dec.decodeLen[0] = 0;
+
+    for (int i = 1; i < 16; ++i) {
+      n = 2 * (n + lenCount[i]);
+      m = (n << (15 - i));
+      if (m > 0xFFFF) {
+        m = 0xFFFF;
+      }
+      dec.decodeLen[i] = m;
+      dec.decodePos[i] = dec.decodePos[i - 1] + lenCount[i - 1];
+      tmpPos[i] = dec.decodePos[i];
+    }
+    for (int i = 0; i < size; ++i) {
+      if (bitLength[i + offset] != 0) {
+        dec.decodeNum[tmpPos[bitLength[offset + i] & 0xF]++] = i;
+      }
+    }
+  }
+
+  List<int> decompress(_RarBitStream bstream, int unpackedSize) {
+    final dDecode = List<int>.filled(rDC, 0);
+    final dBits = List<int>.filled(rDC, 0);
+
+    int dist = 0;
+    int bitLength = 0;
+    int slot = 0;
+
+    for (int i = 0; i < rDBitLengthCounts.length; i++, bitLength++) {
+      for (int j = 0;
+          j < rDBitLengthCounts[i];
+          j++, slot++, dist += (1 << bitLength)) {
+        dDecode[slot] = dist;
+        dBits[slot] = bitLength;
+      }
+    }
+
+    rBuffer = _RarByteBuffer(unpackedSize);
+
+    rarReadTables(bstream);
+
+    while (true) {
+      int num = rarDecodeNumber(bstream, ld);
+
+      if (num < 256) {
+        rBuffer.insertByte(num);
+        continue;
+      }
+      if (num >= 271) {
+        num -= 271;
+        int length = rLDecode[num] + 3;
+        int bits = rLBits[num];
+        if (bits > 0) {
+          length += bstream.readBits(bits);
+        }
+        final distNumber = rarDecodeNumber(bstream, dd);
+        int distance = dDecode[distNumber] + 1;
+        bits = dBits[distNumber];
+        if (bits > 0) {
+          if (distNumber > 9) {
+            if (bits > 4) {
+              distance += ((bstream.getBits() >>> (20 - bits)) << 4);
+              bstream.readBits(bits - 4);
+            }
+            if (lowDistRepCount > 0) {
+              lowDistRepCount--;
+              distance += prevLowDist;
+            } else {
+              final lowDist = rarDecodeNumber(bstream, ldd);
+              if (lowDist == 16) {
+                lowDistRepCount = 15;
+                distance += prevLowDist;
+              } else {
+                distance += lowDist;
+                prevLowDist = lowDist;
+              }
+            }
+          } else {
+            distance += bstream.readBits(bits);
+          }
+        }
+        if (distance >= 0x2000) {
+          length++;
+          if (distance >= 0x40000) {
+            length++;
+          }
+        }
+        rarInsertOldDist(distance);
+        rarInsertLastMatch(length, distance);
+        rarCopyString(length, distance);
+        continue;
+      }
+      if (num == 256) {
+        bstream.readBits((8 - bstream.bitPtr) & 0x7);
+        bool newTable = false;
+        bool newFile = false;
+        if (bstream.readBits(1) != 0) {
+          newTable = true;
+        } else {
+          newFile = true;
+          newTable = bstream.readBits(1) != 0;
+        }
+        if (newFile || (newTable && !rarReadTables(bstream))) {
+          break;
+        }
+        continue;
+      }
+      if (num == 257) {
+        throw RarException('RarVM filters are not supported');
+      }
+      if (num == 258) {
+        if (lastLength != 0) {
+          rarCopyString(lastLength, lastDist);
+        }
+        continue;
+      }
+      if (num < 263) {
+        final distNum = num - 259;
+        final distance = rOldDist[distNum];
+        for (int i = distNum; i > 0; i--) {
+          rOldDist[i] = rOldDist[i - 1];
+        }
+        rOldDist[0] = distance;
+
+        final lengthNumber = rarDecodeNumber(bstream, rd);
+        int length = rLDecode[lengthNumber] + 2;
+        int bits = rLBits[lengthNumber];
+        if (bits > 0) {
+          length += bstream.readBits(bits);
+        }
+        rarInsertLastMatch(length, distance);
+        rarCopyString(length, distance);
+        continue;
+      }
+      if (num < 272) {
+        num -= 263;
+        int distance = rSDDecode[num] + 1;
+        int bits = rSDBits[num];
+        if (bits > 0) {
+          distance += bstream.readBits(bits);
+        }
+        rarInsertOldDist(distance);
+        rarInsertLastMatch(2, distance);
+        rarCopyString(2, distance);
+        continue;
+      }
+    }
+
+    return rBuffer.data;
   }
 }
